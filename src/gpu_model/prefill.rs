@@ -483,7 +483,7 @@ impl GpuModel<'_> {
                     let sink_addr = sink.as_ref().map_or(0, |s| s.ptr);
                     let win = c.swa.get(il).copied().unwrap_or(false).then_some(c.n_swa).unwrap_or(0);
                     let (kca, vca) = match &self.kv_stage {
-                        Some((sk, sv)) if crate::host_attn::on_host(il) => {
+                        Some((sk, sv)) if crate::host_attn::host_layer(self.kv_from, il) => {
                             let bytes = (g.kv_words((self.pos + t) * kv) * 2).min(sk.len());
                             g.dtod(&kc[self.cur], 0, sk, 0, bytes)?;
                             g.dtod(&vc[self.cur], 0, sv, 0, bytes)?;

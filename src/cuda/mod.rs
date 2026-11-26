@@ -30,6 +30,9 @@ pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
 use crate::backend::ATT_SPLITS_1;
 
 pub struct Gpu {
+    /// `attn_host` staging (q, partials, step, mailbox, sequence), made by the first `alloc_host`. Per device handle,
+    /// not static: a static would keep the CUDA context, and with it every freed buffer of an unloaded model, alive.
+    ha: std::sync::Mutex<Option<(Buf, Buf, Buf, Buf, Buf)>>,
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     /// Takes every second launch inside `batch`, so a captured graph runs them as parallel branches.
@@ -445,7 +448,6 @@ static SYNC_EACH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::e
 const HA_T: usize = 64;
 const HA_W: usize = 64 * 514;
 /// Queries, partials, positions, the mailbox (mapped) and the sequence counter (device).
-static HA_STAGE: std::sync::Mutex<Option<(Buf, Buf, Buf, Buf, Buf)>> = std::sync::Mutex::new(None);
 static CTX: std::sync::Mutex<Vec<(u64, u64, usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
 macro_rules! launch {
@@ -540,7 +542,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), ha: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -815,7 +817,7 @@ impl Backend for Gpu {
             ring,
             done,
             lag: Default::default(),
-            fr: Default::default(),
+            fr: Default::default(), ha: Default::default(),
         }))
     }
     /// The type policy gated on this device: `gemm_raw` takes the f16 `gemm_*` path where the arch has no int8
@@ -936,6 +938,16 @@ impl Backend for Gpu {
         Ok(())
     }
 
+    fn trim(&self) {
+        let _ = self.stream.synchronize();
+        let mut pool = std::ptr::null_mut();
+        unsafe {
+            if sys::cuDeviceGetDefaultMemPool(&mut pool, self.ctx.cu_device()) == sys::CUresult::CUDA_SUCCESS {
+                let _ = sys::cuMemPoolTrimTo(pool, 0);
+            }
+        }
+    }
+
     fn alloc_host(&self, bytes: usize) -> anyhow::Result<Buf> {
         // Anonymous memory on 2 MB huge pages (the CPU attention walks it all each token: 4 KB pages cost ~30% in
         // TLB misses), then pinned and mapped into the device with cuMemHostRegister.
@@ -960,7 +972,7 @@ impl Backend for Gpu {
         anyhow::ensure!(dev == h as u64, "mapped host memory has a device address other than its host one (no UVA)");
         let b = Buf::new(dev, bytes, reg);
         // The staging of `attn_host`, made here at load time: allocating inside a graph capture breaks it.
-        let mut st = HA_STAGE.lock().unwrap();
+        let mut st = self.ha.lock().unwrap();
         if st.is_none() {
             let raw = |n: usize| -> anyhow::Result<Buf> { let (b, _) = self.host_mailbox(n.div_ceil(4))?; Ok(b) };
             let (mb, host) = self.host_mailbox(64)?;
@@ -972,7 +984,7 @@ impl Backend for Gpu {
 
     fn attn_host(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize) -> anyhow::Result<bool> {
         if self.kv_mode > 2 || nt > HA_T || hd % 32 != 0 || nh % nkv != 0 || nh * (hd + 2) > HA_W { return Ok(false); }
-        let st = HA_STAGE.lock().unwrap();
+        let st = self.ha.lock().unwrap();
         let Some((bq, bp, bs, mb, seq)) = st.as_ref() else { return Ok(false) };
         let (bq, bp, bs, mb, seq) = (bq.addr(), bp.addr(), bs.addr(), mb.addr(), seq.addr());
         drop(st);

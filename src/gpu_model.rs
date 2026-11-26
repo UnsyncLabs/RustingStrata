@@ -444,6 +444,8 @@ pub struct GpuModel<'a> {
     m: &'a Model<'a>,
     /// `STRATA_KV_HOST` prefill: VRAM copies of one host layer's K and V cache (see `load_part`).
     kv_stage: Option<(Buf, Buf)>,
+    /// The first layer whose KV cache is in host memory (`host_attn`), or none.
+    kv_from: Option<usize>,
     pub gpu: Box<dyn Backend>,
     layers: Vec<Layer>,
     output_norm: Option<GpuTensor>,
@@ -655,7 +657,35 @@ impl<'a> GpuModel<'a> {
         Ok(acc)
     }
 
+    /// `STRATA_KV_HOST` unset or `auto`: the attention KV caches go to VRAM, and only if that load runs out of VRAM
+    /// is it retried with every cache in mapped host memory (CUDA's CPU attention, see `host_attn`).
     fn load_part(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, range: std::ops::Range<usize>, ns: usize) -> anyhow::Result<GpuModel<'a>> {
+        use crate::host_attn::KvHost;
+        let mode = KvHost::env();
+        let first = match mode { KvHost::From(n) => Some(n), _ => None };
+        let mut slot = Some(gpu);
+        let e = match Self::load_part_kv(m, &mut slot, ctx, chunk, vram_margin, k, range.clone(), ns, first) {
+            Ok(g) => return Ok(g),
+            Err(e) => e,
+        };
+        let msg = format!("{e:#}");
+        let oom = msg.contains("OUT_OF_MEMORY") || msg.contains("out of memory") || msg.contains("of VRAM free");
+        match slot {
+            Some(gpu) if mode == KvHost::Auto && oom && gpu.name() == "cuda" => {
+                crate::say!("the KV cache does not fit in VRAM: loading again with it in system RAM (CPU attention; STRATA_KV_HOST=off turns this off)");
+                gpu.trim();
+                let mut slot = Some(gpu);
+                Self::load_part_kv(m, &mut slot, ctx, chunk, vram_margin, k, range, ns, Some(0))
+                    .map_err(|e2| e2.context(format!("with the KV cache in system RAM too (in VRAM: {msg})")))
+            }
+            _ => Err(e),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_part_kv(m: &'a Model<'a>, slot: &mut Option<Box<dyn Backend>>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, range: std::ops::Range<usize>, ns: usize, kv_from: Option<usize>) -> anyhow::Result<GpuModel<'a>> {
+        let gpu = GpuSlot(slot.take(), slot);
+        let on_host = |il: usize| crate::host_attn::host_layer(kv_from, il);
         let c = &m.cfg;
         ensure!(ns == 1 || c.hc_n == 0 && c.n_embd_ple == 0 && c.idx_top_k == 0, "--parallel: not supported for this model (hyper-connections, PLE or QSA)");
         ensure!((1..=255).contains(&ns), "--parallel {ns}: 1 to 255 slots");
@@ -744,8 +774,8 @@ impl<'a> GpuModel<'a> {
                     q: lt(il, "attn_q.weight")?, k: lt(il, "attn_k.weight")?, v: lt(il, "attn_v.weight")?,
                     qn: lt(il, "attn_q_norm.weight")?, kn: lt(il, "attn_k_norm.weight")?, o: lt(il, "attn_output.weight")?,
                     sink: if c.attn_sinks { Some(lt(il, "attn_sinks.weight")?) } else { None },
-                    kc: (0..ns).map(|_| kv_alloc(gpu.as_ref(), il, gpu.kv_words(ctx * kv) * 2)).collect::<anyhow::Result<_>>()?,
-                    vc: (0..ns).map(|_| kv_alloc(gpu.as_ref(), il, gpu.kv_words(ctx * kv) * 2)).collect::<anyhow::Result<_>>()?,
+                    kc: (0..ns).map(|_| kv_alloc(&*gpu, on_host(il), gpu.kv_words(ctx * kv) * 2)).collect::<anyhow::Result<_>>()?,
+                    vc: (0..ns).map(|_| kv_alloc(&*gpu, on_host(il), gpu.kv_words(ctx * kv) * 2)).collect::<anyhow::Result<_>>()?,
                     qsa: if qsa_on && il < c.n_layer && m.w.layer(il, "indexer.k_proj.weight").is_ok() {
                         Some(Qsa {
                             kp: lt(il, "indexer.k_proj.weight")?, qp: lt(il, "indexer.q_proj.weight")?,
@@ -906,8 +936,8 @@ impl<'a> GpuModel<'a> {
                         qn: lt(il, "nextn.enorm.weight")?,
                         kn: lt(il, "nextn.hnorm.weight")?,
                         o: lt(il, "attn_output.weight")?,
-                        kc: (0..ns).map(|_| kv_alloc(gpu.as_ref(), il, gpu.kv_words(ctx * eg_kv) * 2)).collect::<anyhow::Result<_>>()?,
-                        vc: (0..ns).map(|_| kv_alloc(gpu.as_ref(), il, gpu.kv_words(ctx * eg_kv) * 2)).collect::<anyhow::Result<_>>()?,
+                        kc: (0..ns).map(|_| kv_alloc(&*gpu, on_host(il), gpu.kv_words(ctx * eg_kv) * 2)).collect::<anyhow::Result<_>>()?,
+                        vc: (0..ns).map(|_| kv_alloc(&*gpu, on_host(il), gpu.kv_words(ctx * eg_kv) * 2)).collect::<anyhow::Result<_>>()?,
                         qsa: None,
                         sink: None,
                     },
@@ -1078,7 +1108,7 @@ impl<'a> GpuModel<'a> {
         };
         // STRATA_KV_HOST: one layer's cache-sized VRAM buffer pair. Prefill copies a host layer's cache prefix into it
         // (a DMA copy, ~10x what the attention kernel reads from mapped memory) and runs the usual kernel on it.
-        let kv_stage = match layers.iter().enumerate().filter(|(il, _)| crate::host_attn::on_host(*il))
+        let kv_stage = match layers.iter().enumerate().filter(|(il, _)| on_host(*il))
             .filter_map(|(_, l)| match &l.mixer { Mixer::Attn { kc, .. } => kc.first().map(|b| b.len()), _ => None }).max() {
             Some(b) if std::env::var_os("STRATA_HA_NO_STAGE").is_none() => match (gpu.alloc(b), gpu.alloc(b)) {
                 (Ok(k), Ok(v)) => Some((k, v)),
@@ -1141,7 +1171,7 @@ impl<'a> GpuModel<'a> {
         let reset_counts_after_prefill = std::env::var_os("STRATA_RESET_COUNTS").is_some();
         let _ = &mut ext_draft;
         crate::weights::trim_working_set();
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
+        Ok(GpuModel { m, gpu: { let mut gpu = gpu; gpu.0.take().unwrap() }, kv_from, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], ple_undo: ([-1, -1], vec![]), bufs, x, worker, logits, amax, ids, slots, step_buf, rope_buf, rope_offset: 0, hada, mrope: false, mrope_buf: gpu_mrope, ctx, pos: 0, saved, saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], owner: 0, saved_owner: 0, sys_owner: 0, cache_ram: 0, cache, adapt_every, adapt_swaps, reset_counts_after_prefill, hits: 0, misses: 0, tokens: 0, mailbox_writes: Default::default(), mailbox_reads: Default::default(), pids, cpu_time: Duration::ZERO, resumed: Default::default(), lora_applied: Default::default(), drafts: (0, 0), split_time: Default::default(), k, nsnap, short: 32, pf, prompt_cache_path: None, bt, mtp, dflash, ext_draft, ext_draft_pend: Vec::new(), mhc_ones, graph_tag: 0, ngram: None, first: range.start, next: None,
                       cur: 0, seqs, rows: vec![], row_tokens: 0, kv_stage })
     }
 
@@ -3020,7 +3050,7 @@ impl<'a> GpuModel<'a> {
                 g.rope_neox(eg.k.addr(), hd, nt * nkv, nkv, ec.n_rot, h.step_buf.addr(), ec.rope_base)
             })?;
             g.kv_store(eg.k.addr(), eg.v.addr(), kc[self.cur].addr(), vc[self.cur].addr(), kv, nt, h.step_buf.addr(), hd)?;
-            if !(crate::host_attn::on_host(self.m.cfg.n_layer)
+            if !(crate::host_attn::host_layer(self.kv_from, self.m.cfg.n_layer)
                 && g.attn_host(eg.q.addr(), kc[self.cur].addr(), vc[self.cur].addr(), 0, eg.att.addr(), h.step_buf.addr(), nh, nkv, hd, 1.0 / (hd as f32).sqrt(), nt)?) {
                 g.attn_decode_q(eg.q.addr(), kc[self.cur].addr(), vc[self.cur].addr(), 0, eg.att.addr(),
                     eg.attp.addr(), h.step_buf.addr(), nh, nkv, hd, 1.0 / (hd as f32).sqrt(), gq, nt, 0, 0, 0, 0, 0)?;
@@ -3280,7 +3310,7 @@ impl<'a> GpuModel<'a> {
                         _ => (0, 0),
                     };
                     let out_gemm = vg && (nh * hd) % 64 == 0;
-                    let host = sel == 0 && sink_addr == 0 && win == 0 && crate::host_attn::on_host(il)
+                    let host = sel == 0 && sink_addr == 0 && win == 0 && crate::host_attn::host_layer(self.kv_from, il)
                         && g.attn_host(p("q"), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), step, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), nt)?;
                     let aq = if host { 0 } else { g.attn_decode_q(p("q"), kc[self.cur].addr(), vc[self.cur].addr(), if c.q_gate { p("qg") } else { 0 }, p("att"), p("attp"), step, nh, nkv, hd,
                                              1.0 / (hd as f32).sqrt(), gq, nt, if out_gemm { 0 } else { p("attq") }, sel, sst, sink_addr, win)? };
@@ -3661,6 +3691,11 @@ mod tests {
 
 /// `STRATA_KV_HOST=N`: the KV cache of the attention layers from block N on lives in host RAM (mapped pinned
 /// memory the GPU reads over PCIe), freeing VRAM for a longer context. `all` = every layer.
-fn kv_alloc(gpu: &dyn Backend, il: usize, bytes: usize) -> anyhow::Result<Buf> {
-    if crate::host_attn::on_host(il) { gpu.alloc_host(bytes) } else { gpu.alloc(bytes) }
+/// The backend of a load in progress: given back to the caller's slot if the load fails, so it can be retried.
+struct GpuSlot<'s>(Option<Box<dyn Backend>>, &'s mut Option<Box<dyn Backend>>);
+impl std::ops::Deref for GpuSlot<'_> { type Target = dyn Backend; fn deref(&self) -> &Self::Target { self.0.as_deref().unwrap() } }
+impl Drop for GpuSlot<'_> { fn drop(&mut self) { if let Some(g) = self.0.take() { *self.1 = Some(g); } } }
+
+fn kv_alloc(gpu: &dyn Backend, host: bool, bytes: usize) -> anyhow::Result<Buf> {
+    if host { gpu.alloc_host(bytes) } else { gpu.alloc(bytes) }
 }

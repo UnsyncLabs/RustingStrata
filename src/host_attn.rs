@@ -343,14 +343,23 @@ pub unsafe extern "C" fn callback(user: *mut std::ffi::c_void) {
     run(unsafe { &*(user as *const HostAttn) });
 }
 
-/// Whether block `il`'s KV cache lives in host RAM (`STRATA_KV_HOST=N`: blocks N and up, `all`: every one).
-pub fn on_host(il: usize) -> bool {
-    match std::env::var("STRATA_KV_HOST").ok().as_deref() {
-        None | Some("") => false,
-        Some("all") => true,
-        Some(v) => v.parse::<usize>().is_ok_and(|n| il >= n),
+/// `STRATA_KV_HOST`: which attention KV caches live in host memory. Unset or `auto`: in VRAM, in host memory if they
+/// do not fit (see `GpuModel::load_part`); `off`: always VRAM; `all`: every layer; N: layers N and up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KvHost { Auto, Off, From(usize) }
+
+impl KvHost {
+    pub fn env() -> KvHost {
+        match std::env::var("STRATA_KV_HOST").ok().as_deref().map(str::trim) {
+            None | Some("") | Some("auto") => KvHost::Auto,
+            Some("all") => KvHost::From(0),
+            Some(v) => v.parse().map_or(KvHost::Off, KvHost::From),
+        }
     }
 }
+
+/// Whether layer `il`'s cache is in host memory when the first host layer is `from`.
+pub fn host_layer(from: Option<usize>, il: usize) -> bool { from.is_some_and(|n| il >= n) }
 
 /// The CPU side of the `ha_post`/`ha_wait` mailbox at host address `mb` (u32 words: request at 0, context pointer
 /// at 4-5, done at 16). Spins while requests come, naps after 2 ms without one.
